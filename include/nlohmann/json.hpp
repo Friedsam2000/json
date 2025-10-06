@@ -5334,7 +5334,6 @@ struct less< ::nlohmann::detail::value_t> // do not remove the space after '<', 
 #endif
     }
 };
-
 // C++20 prohibit function specialization in the std namespace.
 #ifndef JSON_HAS_CPP_20
 
@@ -5351,6 +5350,148 @@ inline void swap(nlohmann::NLOHMANN_BASIC_JSON_TPL& j1, nlohmann::NLOHMANN_BASIC
 #endif
 
 }  // namespace std
+
+// === sampling_planner_cpp: fast fixed-precision JSON dump ====================
+// Header-only, minimal-overhead dumper optimized for numeric-heavy objects.
+// Formats floating-point numbers with fixed precision; uses std::to_chars
+// when available, otherwise falls back to snprintf so it works on C++11/14.
+
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+  #include <charconv>
+#endif
+#include <cstdio>
+#include <cmath>
+#include <cinttypes>   // PRId64, PRIu64
+#include <limits>
+
+// Small local clamp for C++11/14
+inline int sp_json_clamp_decimals(int d) {
+    if (d < 0) return 0;
+    if (d > 12) return 12;
+    return d;
+}
+
+inline void sp_json_escape_string_minimal(const std::string& s, std::string& out, bool ensure_ascii)
+{
+    out.push_back('"');
+    for (unsigned char ch : s)
+    {
+        switch (ch)
+        {
+            case '\"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (ch < 0x20 || (ensure_ascii && ch >= 0x80))
+                {
+                    char buf[7];
+                    std::snprintf(buf, sizeof(buf), "\\u%04X", static_cast<unsigned>(ch));
+                    out += buf;
+                }
+                else out.push_back(static_cast<char>(ch));
+        }
+    }
+    out.push_back('"');
+}
+
+inline void sp_json_append_int64(std::string& out, std::int64_t v)
+{
+    char buf[32];
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    auto res = std::to_chars(buf, buf + sizeof(buf), v);
+    out.append(buf, static_cast<std::size_t>(res.ptr - buf));
+#else
+    // cast to int64_t to match %" PRId64
+    int n = std::snprintf(buf, sizeof(buf), "%" PRId64, static_cast<std::int64_t>(v));
+    if (n > 0) out.append(buf, static_cast<std::size_t>(n));
+#endif
+}
+
+inline void sp_json_append_uint64(std::string& out, std::uint64_t v)
+{
+    char buf[32];
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    auto res = std::to_chars(buf, buf + sizeof(buf), v);
+    out.append(buf, static_cast<std::size_t>(res.ptr - buf));
+#else
+    // cast to uint64_t to match %" PRIu64
+    int n = std::snprintf(buf, sizeof(buf), "%" PRIu64, static_cast<std::uint64_t>(v));
+    if (n > 0) out.append(buf, static_cast<std::size_t>(n));
+#endif
+}
+
+inline void sp_json_append_double_fixed(std::string& out, double v, int decimals)
+{
+    if (!std::isfinite(v)) { out += "null"; return; }
+
+    char buf[128];  // single buffer
+
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    auto res = std::to_chars(buf, buf + sizeof(buf), v, std::chars_format::fixed, decimals);
+    if (res.ec == std::errc()) {
+        out.append(buf, static_cast<std::size_t>(res.ptr - buf));
+        return;
+    }
+#endif
+    int n = std::snprintf(buf, sizeof(buf), "%.*f", decimals, v);
+    if (n > 0) out.append(buf, static_cast<std::size_t>(n));
+    else out += "null";
+}
+
+
+template <typename BasicJson>
+inline void sp_json_dump_fixed_impl(const BasicJson& j, std::string& out, int decimals, bool ensure_ascii)
+{
+    using value_t = typename BasicJson::value_t;
+    switch (j.type())
+    {
+        case value_t::null: out += "null"; break;
+        case value_t::boolean: out += (j.template get<bool>() ? "true" : "false"); break;
+        case value_t::number_integer: sp_json_append_int64(out, j.template get<std::int64_t>()); break;
+        case value_t::number_unsigned: sp_json_append_uint64(out, j.template get<std::uint64_t>()); break;
+        case value_t::number_float: sp_json_append_double_fixed(out, j.template get<double>(), decimals); break;
+        case value_t::string:
+            sp_json_escape_string_minimal(j.template get_ref<const std::string&>(), out, ensure_ascii);
+            break;
+        case value_t::array:
+            out.push_back('[');
+            for (auto it = j.begin(); it != j.end(); ++it)
+            {
+                if (it != j.begin()) out.push_back(',');
+                sp_json_dump_fixed_impl(*it, out, decimals, ensure_ascii);
+            }
+            out.push_back(']');
+            break;
+        case value_t::object:
+            out.push_back('{');
+            for (auto it = j.begin(); it != j.end(); ++it)
+            {
+                if (it != j.begin()) out.push_back(',');
+                sp_json_escape_string_minimal(it.key(), out, ensure_ascii);
+                out.push_back(':');
+                sp_json_dump_fixed_impl(it.value(), out, decimals, ensure_ascii);
+            }
+            out.push_back('}');
+            break;
+        default:
+            out += j.dump(); break;
+    }
+}
+
+template <typename BasicJson>
+inline std::string nlohmann_json_dump_fixed(const BasicJson& j, int decimals, bool ensure_ascii = false)
+{
+    decimals = sp_json_clamp_decimals(decimals);
+    std::string out;
+    out.reserve(4096);
+    sp_json_dump_fixed_impl(j, out, decimals, ensure_ascii);
+    return out;
+}
+// === end sampling_planner_cpp fast dump ======================================
 
 #if JSON_USE_GLOBAL_UDLS
     #if !defined(JSON_HEDLEY_GCC_VERSION) || JSON_HEDLEY_GCC_VERSION_CHECK(4,9,0)
