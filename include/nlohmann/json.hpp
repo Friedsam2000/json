@@ -5428,7 +5428,7 @@ inline void sp_json_append_double_fixed(std::string& out, double v, int decimals
 {
     if (!std::isfinite(v)) { out += "null"; return; }
 
-    char buf[128];  // single buffer
+    char buf[128];
 
 #if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
     auto res = std::to_chars(buf, buf + sizeof(buf), v, std::chars_format::fixed, decimals);
@@ -5438,8 +5438,23 @@ inline void sp_json_append_double_fixed(std::string& out, double v, int decimals
     }
 #endif
     int n = std::snprintf(buf, sizeof(buf), "%.*f", decimals, v);
-    if (n > 0) out.append(buf, static_cast<std::size_t>(n));
-    else out += "null";
+    if (n < 0) {
+        out += "null";
+        return;
+    }
+    if (static_cast<std::size_t>(n) < sizeof(buf)) {
+        out.append(buf, static_cast<std::size_t>(n));
+        return;
+    }
+
+    std::string dynamic_buf(static_cast<std::size_t>(n) + 1u, '\0');
+    const int written =
+        std::snprintf(dynamic_buf.data(), dynamic_buf.size(), "%.*f", decimals, v);
+    if (written < 0) {
+        out += "null";
+        return;
+    }
+    out.append(dynamic_buf.data(), static_cast<std::size_t>(written));
 }
 
 
